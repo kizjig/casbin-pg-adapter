@@ -14,6 +14,7 @@ import (
 
 const DefaultTableName = "casbin_rule"
 const DefaultDatabaseName = "casbin"
+const DefaultPolicyTypeColumnName = "ptype"
 
 // CasbinRule represents a rule in Casbin.
 type CasbinRule struct {
@@ -35,10 +36,11 @@ type Filter struct {
 
 // Adapter represents the github.com/go-pg/pg adapter for policy storage.
 type Adapter struct {
-	db              *pg.DB
-	tableName       string
-	skipTableCreate bool
-	filtered        bool
+	db                   *pg.DB
+	tableName            string
+	skipTableCreate      bool
+	filtered             bool
+	policyTypeColumnName string
 }
 
 type Option func(a *Adapter)
@@ -62,7 +64,11 @@ func NewAdapter(arg interface{}, dbname ...string) (*Adapter, error) {
 		return nil, fmt.Errorf("pgadapter.NewAdapter: %v", err)
 	}
 
-	a := &Adapter{db: db, tableName: DefaultTableName}
+	a := &Adapter{
+		db:                   db,
+		tableName:            DefaultTableName,
+		policyTypeColumnName: DefaultPolicyTypeColumnName,
+	}
 
 	if err := a.createTableifNotExists(); err != nil {
 		return nil, fmt.Errorf("pgadapter.NewAdapter: %v", err)
@@ -74,7 +80,12 @@ func NewAdapter(arg interface{}, dbname ...string) (*Adapter, error) {
 // NewAdapterByDB creates new Adapter by using existing DB connection
 // creates table from CasbinRule struct if it doesn't exist
 func NewAdapterByDB(db *pg.DB, opts ...Option) (*Adapter, error) {
-	a := &Adapter{db: db, tableName: DefaultTableName}
+	a := &Adapter{
+		db:                   db,
+		tableName:            DefaultTableName,
+		policyTypeColumnName: DefaultPolicyTypeColumnName,
+	}
+
 	for _, opt := range opts {
 		opt(a)
 	}
@@ -99,6 +110,15 @@ func WithTableName(tableName string) Option {
 func SkipTableCreate() Option {
 	return func(a *Adapter) {
 		a.skipTableCreate = true
+	}
+}
+
+// OverridePolicyTypeColumnName overrides the default policy type column name that is used in database queries.
+func OverridePolicyTypeColumnName(colName string) Option {
+	return func(a *Adapter) {
+		if colName != "" {
+			a.policyTypeColumnName = colName
+		}
 	}
 }
 
@@ -354,7 +374,7 @@ func (a *Adapter) RemovePolicies(sec string, ptype string, rules [][]string) err
 
 // RemoveFilteredPolicy removes policy rules that match the filter from the storage.
 func (a *Adapter) RemoveFilteredPolicy(sec string, ptype string, fieldIndex int, fieldValues ...string) error {
-	query := a.db.Model((*CasbinRule)(nil)).Table(a.tableName).Where("ptype = ?", ptype)
+	query := a.db.Model((*CasbinRule)(nil)).Table(a.tableName).Where(fmt.Sprint("%s = ?", a.policyTypeColumnName), ptype)
 
 	idx := fieldIndex + len(fieldValues)
 	if fieldIndex <= 0 && idx > 0 && fieldValues[0-fieldIndex] != "" {
@@ -430,7 +450,7 @@ func (a *Adapter) loadFilteredPolicy(model model.Model, filter *Filter, handler 
 	if filter.P != nil {
 		lines := []*CasbinRule{}
 
-		query := a.db.Model(&lines).Table(a.tableName).Where("ptype = 'p'")
+		query := a.db.Model(&lines).Table(a.tableName).Where(fmt.Sprintf("%s = 'p'", a.policyTypeColumnName))
 		query, err := buildQuery(query, filter.P)
 		if err != nil {
 			return err
@@ -447,7 +467,7 @@ func (a *Adapter) loadFilteredPolicy(model model.Model, filter *Filter, handler 
 	if filter.G != nil {
 		lines := []*CasbinRule{}
 
-		query := a.db.Model(&lines).Table(a.tableName).Where("ptype = 'g'")
+		query := a.db.Model(&lines).Table(a.tableName).Where(fmt.Sprintf("%s = 'g'", a.policyTypeColumnName))
 		query, err := buildQuery(query, filter.G)
 		if err != nil {
 			return err
@@ -519,7 +539,7 @@ func (a *Adapter) UpdateFilteredPolicies(sec string, ptype string, newPolicies [
 
 	err := a.db.RunInTransaction(context.Background(), func(tx *pg.Tx) error {
 		for i := range newP {
-			str, args := line.queryString()
+			str, args := line.queryString(a.policyTypeColumnName)
 			_, err := tx.Model(&oldP).Table(a.tableName).Where(str, args...).Delete()
 			if err != nil {
 				tx.Rollback()
@@ -545,10 +565,10 @@ func (a *Adapter) UpdateFilteredPolicies(sec string, ptype string, newPolicies [
 	return oldPolicies, err
 }
 
-func (c *CasbinRule) queryString() (string, []interface{}) {
+func (c *CasbinRule) queryString(policyTypeColumnName string) (string, []interface{}) {
 	queryArgs := []interface{}{c.Ptype}
 
-	queryStr := "ptype = ?"
+	queryStr := fmt.Sprintf("%s = ?", policyTypeColumnName)
 	if c.V0 != "" {
 		queryStr += " and v0 = ?"
 		queryArgs = append(queryArgs, c.V0)
@@ -611,7 +631,7 @@ func (a *Adapter) updatePolicies(oldLines, newLines []*CasbinRule) error {
 	defer tx.Close()
 
 	for i, line := range oldLines {
-		str, args := line.queryString()
+		str, args := line.queryString(a.policyTypeColumnName)
 		_, err = tx.Model(newLines[i]).Table(a.tableName).Where(str, args...).Update()
 		if err != nil {
 			tx.Rollback()
